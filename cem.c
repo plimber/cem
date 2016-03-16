@@ -8,6 +8,7 @@
 #include "globals.h"
 
 double CellDepth[Xmax][2 * Ymax];      /* Depth array */
+double ShorefaceBathy[Xmax][2 * Ymax];	/* Shoreface bathymetry array #SWAN */
 double CliffHeightSlow = 30;  /* Cliff height above sea level for slow weathering rock PWL */
 double CliffHeightFast = 0;   /* Cliff height above sea level for fast weathering rock PWL */
 
@@ -30,6 +31,14 @@ FILE *ReadSandFile;
 FILE *ReadWaveFile;
 FILE *ReadRealWaveFile;
 FILE *ReadControlFile;
+
+/* PWL, 10-16-13: Must read in the initial file name for SWAN coupling. It is tracked outside
+   CEM in the PBS script loop. #SWAN */
+int		t;
+FILE	*fp;
+FILE	*bathyfile;
+FILE	*Dirfile;
+FILE	*Hsigfile;
 
 /* Computational Arrays (determined for each time step)  -- will eventually be in a structure for BMI */
 
@@ -143,7 +152,6 @@ int OWflag = 0;               /* A debugging flag for overwash routines */
 void AdjustShore (int i);
 void AgeCells (void);
 void ControlFile (void);
-float ConvertAngle(float EvaluateAngle, int type);
 void DetermineAngles (void);
 void DetermineSedTransport (void);
 void DoSink (void);
@@ -165,7 +173,6 @@ void InitPert (void);
 float MassCount (void);
 void OopsImEmpty (int x, int y);
 void OopsImFull (int x, int y);
-void	ParseSWAN(int ShoreAngleLoc, float ShoreAngle);
 void PauseRun (int x, int y, int in);
 void PeriodicBoundaryCopy (void);
 float Raise (float b, float e);
@@ -198,6 +205,12 @@ int initBlock (void);
 int InitWiggly (void);
 void Delay (void);
 void PrintLocalConds (int x, int y, int in);
+
+/* SWAN functions */
+void LoadSWAN(void);
+void ParseSWAN(int ShoreAngleLoc);
+float ConvertAngle(float EvaluateAngle, int type);
+void SaveSWANToFile(void);
 
 
 int cem_initialize (void);
@@ -235,6 +248,14 @@ cem_initialize (void)
       Hsig[i] = Hsig[i - 1] + n_cols;
       Dir[i] = Dir[i - 1] + n_cols;
     }
+  }
+
+  /* With SWAN, no need to shoal waves inside CEM. Instead CEM must read in the SWAN results
+     as matrices ('LoadSWAN'), and then find the breaking wave height & angle using WaveBreakDepth threshold. #SWAN
+	 */
+  if (SWANflag == 'y') {
+	LoadSWAN();
+	printf("\n LoadSWAN\n");
   }
 
   /* Start from file or not? */
@@ -321,13 +342,23 @@ int
 cem_update (void)
 {
 /* 'until' is sent from BMI call ...12/3/14 */
-  int xx;                       /* duration loop variable, moved from former (now deleted) 'main.c' above */
+  int xx;           /* duration loop variable, moved from former (now deleted) 'main.c' above */
 
   {
     /*  Time Step iteration - compute same wave angle for Duration time steps */
 
     /*  Calculate Wave Angle */
-    WaveAngle = FindWaveAngle ();
+    if (SWANflag == 'y') {
+      /* Waveangle is determined outside of CEM for SWAN. I don't know if this correct for BMI version, or other wave models...? 
+       NEW */
+      fp = fopen("Angle","r");
+      fscanf(fp, "%lf", &WaveAngle);
+      fclose(fp);
+      printf("\n Got the angle from file: %lf \n", WaveAngle);
+    }
+    else {
+      WaveAngle = FindWaveAngle ();
+    }
 
     /* output wave data */
     if (Wavedata == 'y')
@@ -345,7 +376,9 @@ cem_update (void)
                 CurrentTimeStep);
       }
 
-      PeriodicBoundaryCopy ();  /* Copy visible data to external model - creates boundaries */
+      if (SWANflag == 'n') {
+	PeriodicBoundaryCopy ();  /* Copy visible data to external model - creates boundaries */
+      }
 
       ZeroVars ();
 
@@ -405,10 +438,13 @@ cem_update (void)
       /*LMV*/ ShadowSweep ();
 
       DetermineAngles ();
-
       DetermineSedTransport ();
 
-      DoSink ();        /* clear sand from sink cells */
+      /* clear sand from sink cells - can probably remove all the sink-related stuff, it isn't very useful...
+	 and has it ever been used? */
+      if (HaveSinks == 'y') {
+	DoSink ();
+      }
 
       FlowInCell ();
       /*LMV*/ FixFlow ();
@@ -416,6 +452,49 @@ cem_update (void)
 
       FixBeach ();
 
+
+      /* OVERWASH */
+      /* because shoreline config may have been changed, need to refind shoreline and recalc angles*/
+            
+      ZeroVars();
+      /* Initialize for Find Beach Cells  (make sure strange beach does not cause trouble */
+            
+      FellOffArray = 'y';
+      FindStart = 1;
+            
+      /*  Look for beach - if you fall off of array, bump over a little and try again */
+            
+      while (FellOffArray == 'y')
+	{
+	  FindBeachCells(FindStart);
+	  /*printf("FoundCells: %d GetO = %c \n", FindStart,FellOffArray);*/
+	  FindStart += FindCellError;
+	  if (FellOffArray == 'y')
+	    {
+	      /*printf("NOODLE  !!!!!FoundCells: %d GetO = %c \n", FindStart,FellOffArray); */
+	      /*PauseRun(1,1,-1);*/
+	    }
+                
+	  /* Get Out if no good beach spots exist - finish program*/
+                
+	  if (FindStart > Ymax/2+1)
+	    {
+	      printf("Stopped Finding Beach - done %d %d",FindStart,Ymax/2-5);
+	      SaveSandToFile();
+	      return 1;
+	    }
+	}
+            
+      /* printf("Foundbeach!: %d \n", CurrentTimeStep); */
+            
+      ShadowSweep();
+      if (debug0) printf("Shadowswept: %d \n", CurrentTimeStep);
+      DetermineAngles();
+      if (debug0) printf("AngleDet: %d \n", CurrentTimeStep);
+      CheckOverwashSweep();
+      FixBeach();
+
+      
       /* Age Empty Cells */
       if ((CurrentTimeStep % AgeUpdate == 0) && SaveAge)
         AgeCells ();
@@ -424,15 +503,26 @@ cem_update (void)
       MassCurrent = MassCount ();
 
       /* SAVE FILE ? */
-      if ((CurrentTimeStep % SaveSpacing == 0 &&
-           CurrentTimeStep > StartSavingAt)) {
-        if (SaveLine)
-          SaveLineToFile ();
-        if (SaveFile)
-          SaveSandToFile ();
+      if (SWANflag == 'n') {
+	if ((CurrentTimeStep % SaveSpacing == 0 &&
+	     CurrentTimeStep > StartSavingAt)) {
+	  if (SaveLine)
+	    SaveLineToFile ();
+	  if (SaveFile)
+	    SaveSandToFile ();
+	}
       }
 
       CurrentTimeStep++;
+      /* If SWAN, save shoreface bathy to file. And redo SaveSand -- must save it AFTER time step iterates */
+      if (SWANflag == 'y') {
+	SaveSWANToFile();
+	if (((CurrentTimeStep%SaveSpacing == 0 && CurrentTimeStep >= StartSavingAt)
+	     || (CurrentTimeStep == StopAfter)) && SaveFile == 'y')
+	  {
+	    SaveSandToFile();
+	  }
+      }
 
     }
   }
@@ -2081,7 +2171,7 @@ WeatherRock (int j)
       else {
         wscale = (NoWeathering - Wcrit) / (log ((0.01 / N)));   /* Decay coefficient for the "cover" portion of abrasion curve PWL */
         WeatheringRatePerYear =
-          AngleFactor * CurrentWeatherCoeff *
+          CurrentWeatherCoeff *
           (exp ((MinDistToBeach[j] - Wcrit) / wscale));
       }
     }
@@ -2097,8 +2187,8 @@ WeatherRock (int j)
 
   if (debug12)
     printf
-      ("for %d (%d,%d) rock %c, angfactor %f, weathercoeff %f, mindist %f, rate %f m/yr, frac weathered %f\n",
-       j, XRock[j], YRock[j], TypeOfRock[XRock[j]][YRock[j]], AngleFactor,
+      ("for %d (%d,%d) rock %c, weathercoeff %f, mindist %f, rate %f m/yr, frac weathered %f\n",
+       j, XRock[j], YRock[j], TypeOfRock[XRock[j]][YRock[j]], 
        CurrentWeatherCoeff, MinDistToBeach[j], WeatheringRatePerYear,
        AmountWeathered[j]);
 
@@ -2574,66 +2664,30 @@ DetermineSedTransport (void)
     MaxTrans = 'n';
 
     /*  Is littoral transport going left or right?  */
-	  /* #SWAN, 11/27/14: this isn't necessarily correct when SWAN is involved --
-     * short-period waves can refract around and break going the opposite direction of their deep-water direction.  */
-	  /* Parse SWAN here first, and make this determination with 'breaking wave' angles */
-	  /* OY VAY */
-	  if (SWANflag == 'y')
-	  {
-		  ParseSWAN(i, DummyAngle); /* Use dummy shore angle because we don't need it right now...prob a poor solution to the problem */
-	  }
+
+    if ((WaveAngle-ShorelineAngle[i]) > 0)
+      {
+	/*  Transport going right, center on cell to left side of border	 */
+	/*  Next cell in positive direction, no correction term needed 		*/
+	CalcCell = i;
+	Next = 1;
+	Last = -1;
+	Correction = 0;
+	DirectionAcrossBorder[i] = 'r'; /*LMV*/
+	if (debug5) printf("RT  ");
+      }
+    else
+      {
+	/*  Transport going left, center on cell to right side of border 	*/
+	/*  Next cell in negative direction, correction term needed 		*/
+	CalcCell = i+1;
+	Next = -1;
+	Last = 1;
+	Correction = -1;
+	DirectionAcrossBorder[i] = 'l'; /*LMV*/
+	if (debug5) printf("LT  ");
+      }
 	  
-	  if (SWANflag == 'y')
-	  {
-		  if ((Angle - ShorelineAngle[i]) > 0) /* Use SWAN nearshore angle instead */
-		  {
-			  /*  Transport going right, center on cell to left side of border	 */
-			  /*  Next cell in positive direction, no correction term needed 		*/
-			  CalcCell = i;
-			  Next = 1;
-			  Last = -1;
-			  Correction = 0;
-			  DirectionAcrossBorder[i] = 'r'; /*LMV*/
-			  if (debug5) printf("RT  ");
-		  }
-		  else
-		  {
-			  /*  Transport going left, center on cell to right side of border 	*/
-			  /*  Next cell in negative direction, correction term needed 		*/
-			  CalcCell = i+1;
-			  Next = -1;
-			  Last = 1;
-			  Correction = -1;
-			  DirectionAcrossBorder[i] = 'l'; /*LMV*/
-			  if (debug5) printf("LT  ");
-		  }
-	  }
-	  
-	  else if (SWANflag == 'n') /* #SWAN */
-	  {
-		  if ((WaveAngle-ShorelineAngle[i]) > 0)
-		  {
-			  /*  Transport going right, center on cell to left side of border	 */
-			  /*  Next cell in positive direction, no correction term needed 		*/
-			  CalcCell = i;
-			  Next = 1;
-			  Last = -1;
-			  Correction = 0;
-			  DirectionAcrossBorder[i] = 'r'; /*LMV*/
-			  if (debug5) printf("RT  ");
-		  }
-		  else
-		  {
-			  /*  Transport going left, center on cell to right side of border 	*/
-			  /*  Next cell in negative direction, correction term needed 		*/
-			  CalcCell = i+1;
-			  Next = -1;
-			  Last = 1;
-			  Correction = -1;
-			  DirectionAcrossBorder[i] = 'l'; /*LMV*/
-			  if (debug5) printf("LT  ");
-		  }
-	  }
 	  
 
     if (InShadow[CalcCell] == 'n') {
@@ -2768,7 +2822,7 @@ SedTrans (int i, int From, float ShoreAngle, char MaxT, int Last)
   {
     return;
   }
-  else if (SWANflag == 'n')
+  if (SWANflag == 'n')
   {
     /* Calculate Deep Water Celerity & Length, Komar 5.11 c = gT / pi, L = CT       */
 
@@ -2818,34 +2872,20 @@ SedTrans (int i, int From, float ShoreAngle, char MaxT, int Last)
         Depth -= RefractStep;
     }
   }
-	else if (SWANflag == 'y') /* Do SWAN */
-	{
-		/* Instead of shoaling above, use ParseSWAN function to find the breaking wave characteristics. */
-		ParseSWAN(From, ShoreAngle);
-	}
+  else if (SWANflag == 'y') /* Do SWAN */
+    {
+      /* Instead of shoaling above, use ParseSWAN function to find the breaking wave characteristics. */
+      ParseSWAN(From);
+    }
 	  
 
-    /* Now Determine Transport */
-    /* eq. 9.6b (10.8) Komar, including assumption of sed density = 2650 kg/m3              */
-    /* additional accuracy here will not improve an already suspect eqn for sed transport   */
-    /* (especially with poorly constrained coefficients),                                   */
-    /* so no attempt made to make this a more perfect imperfection                          */
-	  if (SWANflag == 'n')
-	  {
-		  VolumeAcrossBorder[i] =	fabs(1.1*rho*Raise(g,3.0/2.0)*Raise(WvHeight,2.5)*
-										 cos(Angle)*sin(Angle)*TimeStep); /*LMV - now global array*/
-	  }
-	  else /* Do Qs slightly different for SWAN input */
-	  {
-		  VolumeAcrossBorder[i] = fabs(0.2*rho*Raise(g,3.0/2.0)*Raise(WvHeight,2.5)*
-									cos(Angle-ShoreAngle)*sin(Angle-ShoreAngle)*TimeStep);
-		  
-		  if (UpWind[From] == 'u') /* Use wave characteristics updrift */
-		  {
-			  VolumeAcrossBorder[i] = fabs(0.2*rho*Raise(g,3.0/2.0)*Raise(Hsigdebug[From+Last],2.5)*
-										cos(Dirdebug[From+Last]-ShoreAngle)*sin(Dirdebug[From+Last]-ShoreAngle)*TimeStep);
-		  }
-	  }    
+  /* Now Determine Transport */
+  /* eq. 9.6b (10.8) Komar, including assumption of sed density = 2650 kg/m3              */
+  /* additional accuracy here will not improve an already suspect eqn for sed transport   */
+  /* (especially with poorly constrained coefficients),                                   */
+  /* so no attempt made to make this a more perfect imperfection                          */
+      VolumeAcrossBorder[i] =	fabs(1.1*rho*Raise(g,3.0/2.0)*Raise(WvHeight,2.5)*
+				     cos(Angle)*sin(Angle)*TimeStep); /*LMV - now global array*/
 	  
 	  /*LMV VolumeIn/Out is now calculated below in AdjustShore */
 
@@ -3277,7 +3317,7 @@ TransportSedimentSweep (void)
 void
 AdjustShore (int i)
 
-        /*  Complete mass balance for incoming and ougoing sediment                     */
+        /*  Complete mass balance for incoming and outgoing sediment                     */
         /*  This function will change the global data array PercentFullSand[][]         */
         /*  Uses but does not adjust arrays:                                            */
         /*              X[], Y[], ShorelineAngle[], ActualVolumeAcross  LMV             */
@@ -4705,8 +4745,7 @@ ReadSandFromFile (void)
 /*  Reads saved output file, AllBeach[][] & PercentFullSand[][]	 */
 /*  LMV - Also reads saved output file, AllRock[][], PercentFullRock[][], TypeOfRock[][]  */
 {
-  int x,
-    y;
+  int x,y,Xbeach,timefilename;
 
   ReadSandFile = fopen (readfilename, "r");
   printf ("CHECK READ \n");
@@ -4749,31 +4788,45 @@ ReadSandFromFile (void)
 
   else {        /*Array file input */
 
-    for (x = (Xmax - 1); x >= 0; x--) {
-      for (y = Ymax / 2; y < 3 * Ymax / 2; y++) {
-        fscanf (ReadSandFile, " %c", &TypeOfRock[x][y]);
+    /* If using SWAN, do loading differently. */
+    /* 1-12-16: current SWAN loading scheme doesn't support rocks! only PFS */
+    if (SWANflag == 1 && timefilename == 0)
+      {
+	/* get readfilename as string */
+	fp = fopen("Timestep", "r");
+	fscanf(fp, "%s", readfilename);
+	fclose(fp);
+	
+	fp = fopen("Timestep", "r");
+	fscanf(fp, "%d", &timefilename);
+	fclose(fp);
       }
-      fscanf (ReadSandFile, "\n");
-    }
 
-    for (x = (Xmax - 1); x >= 0; x--) {
-      for (y = Ymax / 2; y < 3 * Ymax / 2; y++) {
-        fscanf (ReadSandFile, " %lf", &PercentFullRock[x][y]);
-
-        if (PercentFullRock[x][y] >= 1.0)
-          AllRock[x][y] = 'y';
-        else
-          AllRock[x][y] = 'n';
+      for (x = (Xmax - 1); x >= 0; x--) {
+	for (y = Ymax / 2; y < 3 * Ymax / 2; y++) {
+	  fscanf (ReadSandFile, " %c", &TypeOfRock[x][y]);
+	}
+	fscanf (ReadSandFile, "\n");
       }
-      fscanf (ReadSandFile, "\n");
-    }
 
-    for (x = (Xmax - 1); x >= 0; x--) {
-      for (y = Ymax / 2; y < 3 * Ymax / 2; y++) {
-        fscanf (ReadSandFile, " %lf", &PercentFullSand[x][y]);
+      for (x = (Xmax - 1); x >= 0; x--) {
+	for (y = Ymax / 2; y < 3 * Ymax / 2; y++) {
+	  fscanf (ReadSandFile, " %lf", &PercentFullRock[x][y]);
 
-        if ((PercentFullSand[x][y] + PercentFullRock[x][y]) >= 1.0)
-          AllBeach[x][y] = 'y';
+	  if (PercentFullRock[x][y] >= 1.0)
+	    AllRock[x][y] = 'y';
+	  else
+	    AllRock[x][y] = 'n';
+	}
+	fscanf (ReadSandFile, "\n");
+      }
+
+      for (x = (Xmax - 1); x >= 0; x--) {
+	for (y = Ymax / 2; y < 3 * Ymax / 2; y++) {
+	  fscanf (ReadSandFile, " %lf", &PercentFullSand[x][y]);
+
+	  if ((PercentFullSand[x][y] + PercentFullRock[x][y]) >= 1.0)
+	    AllBeach[x][y] = 'y';
         else
           AllBeach[x][y] = 'n';
       }
@@ -4807,6 +4860,14 @@ SaveSandToFile (void)
   int x,
     y;
   char savename[40];
+  int timefilename;
+
+  /* get savefilename #SWAN */
+  fp = fopen("Timestep", "r");
+  fscanf(fp, "%d", &timefilename);
+  timefilename = timefilename+1; /* iterate name with time step */
+  sprintf(savefilename, "%d", timefilename); /* convert int timestep to filename string */
+  fclose(fp);
 
   printf ("\n saving \n ");
 
@@ -5863,94 +5924,100 @@ float ConvertAngle(float EvaluteAngle, int type)
  
  #SWAN */
 {
+
+  float value;	/* What direction to look offshore to find a breaking wave? */
 	
-	float value;	/* What direction to look offshore to find a breaking wave? */
+  /*if (debugSWAN)*/
+  /*printf("\n incoming angle: %f \n", EvaluateAngle);*/
 	
-	/*if (debugSWAN)*/
-	/*printf("\n incoming angle: %f \n", EvaluateAngle);*/
-	
-	if (type == 1)
+  if (type == 1)
+    {
+		
+      /* Moving right and down along shoreline -- most common case, unless we have spits or cape
+	 tip overgrowth */
+      if (EvaluateAngle > (-90*(pi/180)) && EvaluateAngle < (0*(pi/180)))
 	{
-		
-		/* Moving right and down along shoreline -- most common case, unless we have spits or cape
-		 tip overgrowth */
-		if (EvaluateAngle > (-90*(pi/180)) && EvaluateAngle < (0*(pi/180)))
-		{
-			value = EvaluateAngle + (90*(pi/180));
-		}
-		
-		/* Moving right and up (or just right) along shoreline -- most common case, unless we have 
-		 spits or cape tip overgrowth */
-		else if (EvaluateAngle > (0*(pi/180) && EvaluateAngle < (90*(pi/180))))
-		{
-			value =  (360*(pi/180)) - EvaluateAngle;
-		}
-		
-		/* Moving right, stright shoreline (dx = 0) */
-		else if(EvaluateAngle == 0)
-		{
-			value = 0;
-		}
-		
-		/* Moving straight up or straight down along shoreline */
-		else if (EvaluateAngle == (-90*(pi/180)) || 
-				 EvaluateAngle == (90*(pi/180)))
-		{
-			if (EvaluateAngle == (-90*(pi/180)))
-			{
-				value = (270*(pi/180));
-			}
-			else if (EvaluateAngle == (90*(pi/180)))
-			{
-				value = (90*(pi/180));
-			}
-		}
-		
-		/* Moving left (and up, down, or straight) along shoreline */
-		else if (EvaluateAngle > (-270*(pi/180) && EvaluateAngle < (-90*(pi/180))))
-		{
-			value = fabs(EvaluateAngle);
-		}
-		
-		/* Oops -- did not find a search direction! */
-		else 
-		{
-			printf("\n Can't look offshore for SWANs 'cause i didn't find a surrounding angle! (in ParseSWAN) \n");
-		}
-		
-		/* Print to screen, if you like */
-		/*if (debugSWAN) printf("\n search direction: %f , surrounding angle: %f \n",
-		 value, EvaluateAngle);*/
-		
-		/* Return value. */
-		return value;
+	  value = EvaluateAngle + (90*(pi/180));
+	}
+
+      /* Moving right and up (or just right) along shoreline -- most common case, unless we have 
+	 spits or cape tip overgrowth */
+      else if (EvaluateAngle > (0*(pi/180) && EvaluateAngle < (90*(pi/180))))
+	{
+	  value =  (360*(pi/180)) - EvaluateAngle;
 	}
 	
-	/* -----> Types other than 1 <----- */
-	/* Convert SWAN azimuthal angle */
-	else
+      /* Moving right, straight shoreline (dx = 0) */
+      else if(EvaluateAngle == 0)
 	{
-		/* Wave going right to left */
-		if (EvaluateAngle > 0 && EvaluateAngle < 90)
-		{
-			return -EvaluateAngle*(pi/180);
-		}
-		/* Wave going left to right */
-		else if (EvaluateAngle < 360 && EvaluateAngle > 270)
-		{
-			return (360-EvaluateAngle)*(pi/180);
-		}
-		/* Wave coming straight onshore */
-		else if(EvaluateAngle == 0 || EvaluateAngle == 360)
-		{
-			return 0;
-		}
+	  value = 0;
 	}
-  return 0.;
+
+      /* Moving straight up or straight down along shoreline */
+      else if (EvaluateAngle == (-90*(pi/180)) || 
+	       EvaluateAngle == (90*(pi/180)))
+	{
+	  if (EvaluateAngle == (-90*(pi/180)))
+	    {
+	      value = (270*(pi/180));
+	    }
+	  else if (EvaluateAngle == (90*(pi/180)))
+	    {
+	      value = (90*(pi/180));
+	    }
+	}
+
+      /* Moving left (and up, down, or straight) along shoreline */
+      else if (EvaluateAngle > (-270*(pi/180) && EvaluateAngle < (-90*(pi/180))))
+	{
+	  value = fabs(EvaluateAngle);
+	}
+
+      /* Oops -- did not find a search direction! */
+      else 
+	{
+	  value = 0;
+	  printf("\n Can't look offshore for SWANs 'cause i dind't find a surrounding angle! (in ParseSWAN) \n");
+	}
+
+      /* Print to screen, if you like */
+      /*if (debugSWAN) printf("\n search direction: %f , surrounding angle: %f \n",
+	value, EvaluateAngle);*/
+
+      /* Return value. */
+      return value;
+    }
+	
+  /* -----> Types other than 1 <----- */
+  /* Convert SWAN azimuthal angle */
+  else
+    {
+      /* Wave going right to left */
+      if (EvaluateAngle > 0 && EvaluateAngle < 90)
+	{
+	  return -EvaluateAngle*(pi/180);
+	}
+      /* Wave going left to right */
+      else if (EvaluateAngle < 360 && EvaluateAngle > 270)
+	{
+	  return (360-EvaluateAngle)*(pi/180);
+	}
+      /* Wave coming straight onshore */
+      else if (EvaluateAngle == 0 || EvaluateAngle == 360)
+	{
+	  return 0;
+	}
+      else
+	{
+	  return 0;
+	}
+    }
 }
 
-/* SWAN data parse function! PWL, 10-18-13. #SWAN */
-void ParseSWAN (int ShoreAngleLoc, float ShoreAngle)
+
+
+/* SWAN data parse function! */
+void ParseSWAN (int ShoreAngleLoc)
 {
 	float	LookOffshore;	/* What direction to look offshore to find a breaking wave? */
 	/* float	LookSlope; */	/* What slope (x,y) is the line of sight? */
@@ -5983,23 +6050,25 @@ void ParseSWAN (int ShoreAngleLoc, float ShoreAngle)
 	{
 		printf("\n no alongshore location, barf \n");
 	}
+
+
+	/* IMPORTANT --- > READ ME
+	   This function steps along the shoreline and looks offshore to find breaking waves (height and period). The breaking waves then drive sediment transport. 
+	   Currently, the search routine only looks straight up from the origin shoreline cell. 
+	   This is a simplification appropriate for low-curvature coastlines in low-angle wave climates but breaks down for high-curvature coasts 
+	   (e.g. for capes and spits formed by high angle waves). 
+	   The commented code below is a skeleton for a more robust offshore search routine that looks offshore in a direction depending on local coastline orientation. Until this
+	   routine is completed, the SWAN component of CEM will not work on high-angle coasts! */
 	
-	/* FIRST STEP! find the direction to look offshore. Should be perpendicular to the shoreline
-	 orientation defined by the variable SurroundingAngle. The convention is strange, so use
-	 'ConvertAngle' function below to separate different cases. The end result will be an azimuthal
-	 search direction, where 0 (& 360) is straight up (seaward) */
-	/* NOTE, 10-22-13: i wonder if the calcs below will be precise enough to satisfy the conditional
-	 statements? */
+	/* FIRST STEP! find the direction to look offshore. Should be perpendicular to the shoreline */
+	/*  orientation defined by the variable SurroundingAngle. The convention is strange, so use */
+	/*  'ConvertAngle' function to separate different cases. The end result will be an azimuthal */
+	/*  search direction, where 0 (& 360) is straight up (seaward) */
 	
-	/* 11-14-13: This doesn't work to calculate Qs because Qs needs a sign to indicate direction...*/
-	/* This conversion will be useful again when the angle-based search function is used. */
 	
 	/* Convert shoreline angle to azimuth */
 	/*LookOffshore = ConvertAngle(SurroundingAngle[ShoreAngleLoc], 1);*/
-	
-	/* i think this is incorrect -- PWL 11/20/14 */
-	/* Don't use Surrounding Angle for Qs! This method is ignoring upwind conditions */
-	LookOffshore = SurroundingAngle[ShoreAngleLoc];
+       	LookOffshore = SurroundingAngle[ShoreAngleLoc];
 	
 	
 	/* NEXT STEP */
@@ -6039,72 +6108,212 @@ void ParseSWAN (int ShoreAngleLoc, float ShoreAngle)
 		xcoord = xcoord + x;
 		HowFar = x;
 		/* ------ */
-		ydebug[ShoreAngleLoc] = 6;
 		/* Is this a breaking wave cell? Also, make sure not to divide by zero or else your computer will explode */
 		/* May need to lower breaking wave threshold and/or change resolution of nested grid -- do some tests! #SWAN */
 
 		if (ShelfDepth[xcoord][ycoord] > 0 && ShelfDepth[LastXCell][ycoord] > 0 && Hsig[LastXCell][ycoord] > 0)
-		{
-			Hd = Hsig[xcoord][ycoord]/(ShelfDepth[xcoord][ycoord]);
+		  {
+		    Hd = Hsig[xcoord][ycoord]/(ShelfDepth[xcoord][ycoord]);
 			
-            /*if (debugSWAN)
-			 printf("H/D threshold: %f\n", Hd);*/
-			ydebug[ShoreAngleLoc] = 1;    
+		    if (Hd < WaveBreakDepth && Hd > 0 && ShelfDepth[LastXCell][ycoord] > 0)
+		      {
+				
+			/* 11-12-13: When using angle-based function, replace 'ycoord' with 'LastYCell' */
+				
+			/* Wave broke! debug if necessary and then step back and take values from previous cell */
+			/*LookOffshore = LookOffshore*(180/pi); Convert angle to degrees because SWAN is in degrees */
+				
+			/* Stepping back... */
+			/* UPDATE, 11/24/14: don't step back! Replaced [LastXCell] with [xcoord]*/
+			WvHeight = Hsig[xcoord][ycoord];
+			EvaluateAngle = Dir[xcoord][ycoord];
+			CAngle = ConvertAngle(EvaluateAngle, 2); /* Convert angle from azimuth (degrees) to CEM-style (rads) */
+			/*Angle = CAngle - LookOffshore; Angle is made relative to shore */
+			Angle = CAngle; /* NEW METHOD 11/20/14 PWL */
+			BreakDepth = ShelfDepth[xcoord][ycoord];
+			/*OopsImBroke = 1;*/
+			/*if (debugSWAN) */
+			/*{*/
 			
-			if (Hd < WaveBreakDepth && Hd > 0 && ShelfDepth[LastXCell][ycoord] > 0)
-			{
+			/*LookOffshore = LookOffshore*(180/pi);*/ /* Convert angle to degrees because SWAN is in degrees */
+									
+			/* Stepping back... */
+			WvHeight = Hsig[LastXCell][ycoord];
+			EvaluateAngle = Dir[LastXCell][ycoord];
+			CAngle = ConvertAngle(EvaluateAngle, 2); /* Convert angle from azimuth (degrees) to CEM-style (rads) */
+			Angle = CAngle - LookOffshore; /* Angle is made relative to shore */
+			BreakDepth = ShelfDepth[LastXCell][ycoord];
+			/*OopsImBroke = 1;*/
 				
-				/* 11-12-13: When using angle-based function, replace 'ycoord' with 'LastYCell' */
-				
-				/* Wave broke! debug if necessary and then step back and take values from previous cell */
-				/*LookOffshore = LookOffshore*(180/pi); Convert angle to degrees because SWAN is in degrees */
-				
-				/* Stepping back... */
-				/* UPDATE, 11/24/14: don't step back! Replaced [LastXCell] with [xcoord]*/
-				WvHeight = Hsig[xcoord][ycoord];
-				EvaluateAngle = Dir[xcoord][ycoord];
-				CAngle = ConvertAngle(EvaluateAngle, 2); /* Convert angle from azimuth (degrees) to CEM-style (rads) */
-				/*Angle = CAngle - LookOffshore; Angle is made relative to shore */
-				Angle = CAngle; /* NEW METHOD 11/20/14 PWL */
-				BreakDepth = ShelfDepth[xcoord][ycoord];
-				/*OopsImBroke = 1;*/
-				/*if (debugSWAN) */
-				/*{*/
-				/*printf("WvHeight: %f , Conv Angle: %f, Adj Angle: %f, DepthBreak: %f, x: %d, y: %d, LO: %f, distance: %d \n",
-				 Hsig[LastXCell][ycoord], CAngle, Angle, ShelfDepth[LastXCell][ycoord], LastXCell, 
-				 ycoord, LookOffshore, HowFar);*/
-				/* Save to file! */
-				/*printf("Saving SWAN shoreface bathy as: %s 		", SWANsavename);*/
-				/* Save stuff to text file, PWL 5-5-14 #SWAN */
-				Hsigdebug[ShoreAngleLoc] = WvHeight;
-				Dirdebug[ShoreAngleLoc] = Angle;
-				Hddebug[ShoreAngleLoc] = BreakDepth;
-				xdebug[ShoreAngleLoc] = xcoord;
-				ydebug[ShoreAngleLoc] = ShoreAngleLoc;    
-				/*}*/
-				
-				break; /* delete break and use OopsImBroke with angle-based function, 11-12-13 */
-			}
-		}
-		else
-		{
-			ydebug[ShoreAngleLoc] = 5;
-		}
-		
+			break; /* delete break and use OopsImBroke with angle-based function, 11-12-13 */
+		      }
+		  }
+
 		/* Not a breaking wave cell, update last cell position and keep loopin' */
 		/*if (floor(Xpos) != LastXCell)
-		 {
-		 LastXCell = floor(Xpos);
-		 }
-		 if (floor(Ypos) != LastYCell)
-		 {
-		 LastYCell = floor(Ypos);
-		 }*/
+		  {
+		  LastXCell = floor(Xpos);
+		  }
+		  if (floor(Ypos) != LastYCell)
+		  {
+		  LastYCell = floor(Ypos);
+		  }*/
 	}
 	/*}*/
-	
+
 	/* We're done here, muchacho. Return some values to the parent function -- currently the 
-	 values to be returned are global, so no further action needed... */
-	
+	   values to be returned are global! So, no further action needed... */
+	 
 }
+
+void SaveSWANToFile(void)
+
+/*  Interpolates shoreface bathymetry using shoreface depth, shoreline, and shoreface slope.
+    Then it adds the shoreface bathy to the SWAN shelf bathy file, checks for booboos, and
+    exports it to file so that SWAN can pick it up and simulate some wave action. #SWAN */
+
+/* NOTE: This function is a work in progress -- interpolating the shoreface bathy is not a trivial
+   exercise. */
+
+{
+  int		x,y,xx;									/* Iteraters gonna iterate */
+  double	Sdepth;									/* Iterating shoreface depth, m */
+  char	SWANsavename[24]="Depth.bot";			/* Must be .bot for SWAN, if Matlab is not used */
+  int		length;									/* Length eroding cell has retreated landward */
+  int		LandHeightAdjust = 1;					/* Needed for SWAN -- land height behind shoreline 
+									   must be clearly above sea level */
+  int		flag;									/* Flag tracks when the intersection of the shoreface
+											   and shelf occurs */
+  int		DepthShorefaceLow = 5;					/* Use different shoreface depth to make bathymetry smoother */
+  double PercentFull[Xmax][2 * Ymax];
+	
+  /* debugging text file output names, 5-5-14 #SWAN */
+  char	Qssavename[24];
+  char	Hsigsavename[24];
+  char	Dirsavename[24];
+  char	Hdsavename[24];
+  char    xsavename[24];
+  char    ysavename[24];
+  char	timefilename;
+  char    tempname;
+	
+  /* First, assign PercentFull array to ShorefaceBathy. Correct all partially full cells
+     to fully full cells for SWAN. */
+  for (y = 0; y < 2*Ymax; y++) {
+    for (x = 0; x < Xmax; x++) {
+      PercentFull[x][y] = PercentFullSand[x][y] + PercentFullRock[x][y];
+      /* Make sure PFS + PFR isn't greater than 1, or less than zero */
+      if (PercentFull[x][y] > 1) {
+	PercentFull[x][y] = 1;
+      }
+      else if (PercentFull[x][y] < 0) {
+	PercentFull[x][y] = 0;
+      }
+      ShorefaceBathy[x][y] = PercentFull[x][y];
+      if (ShorefaceBathy[x][y] < 1 && ShorefaceBathy[x][y] > 0) {
+	ShorefaceBathy[x][y] = 1;
+      }
+    }
+  }
+
+	/*printf("in SaveSWAN\n");*/
+	/* Loop through domain and fill in shoreface bathy. Stop filling in when the shelf is intersected. */ 
+	/* This is the simple routine. Looks straight offshore. */
+
+	
+  for (y = Ymax/2; y < 3*Ymax/2; y++)
+    {
+      /* Reset flag and depth tracker for each alongshore column */
+      Sdepth = 0;
+      flag = 0;
+      for (x = 0; x < Xmax; x++)
+	{
+			
+	  /* Land */
+	  if (PercentFull[x][y] == 1)
+	    {
+	      ShorefaceBathy[x][y] = -(LandHeight+LandHeightAdjust);
+	    }
+	  /* Shoreline */
+	  else if (PercentFull[x][y] < 1 && PercentFull[x][y] > 0)
+	    {
+	      ShorefaceBathy[x][y] = 0;
+	    }
+			
+	  else if (flag == 1)
+            {
+	      ShorefaceBathy[x][y] = ShelfDepth[x][y];
+            }
+            
+	  /* Water -- shoreface or shelf? */
+	  else if (PercentFull[x][y] == 0 && flag == 0)
+	    {
+	      /*Sdepth = (ShorefaceBathy[x-1][y]) + ShorefaceSlope*CellWidth;*/
+	      Sdepth = (Sdepth) + ShorefaceSlope*CellWidth;
+				
+	      /*if (Sdepth > DepthShoreface)
+		{
+		Sdepth = DepthShoreface;
+		}*/
+				
+				
+	      /* Not yet intersected shelf */
+	      if (Sdepth <= DepthShorefaceLow)
+		{
+		  ShorefaceBathy[x][y] = Sdepth;
+		}
+				
+	      /* Found shelf? */
+	      else if (Sdepth > DepthShorefaceLow)
+		{
+		  /* Reached shoreface depth, but haven't hit shelf yet -- keep going down */
+		  if (Sdepth < ShelfDepth[x][y])
+		    {
+		      /*ShorefaceBathy[x][y] = ShelfDepth[x][y];*/
+		      ShorefaceBathy[x][y] = Sdepth;
+		    }
+					
+		  /* Reached shoreface depth, but overshot shelf depth -- take shelf depth */
+		  else if(Sdepth >= ShelfDepth[x][y])
+		    {
+		      /*ShorefaceBathy[x][y] = DepthShoreface;*/
+		      ShorefaceBathy[x][y] = ShelfDepth[x][y];
+		      flag = 1;
+		    }
+					
+		  /* If first time here, set flag. This indicates that the shelf
+		     has been intersected. Now, to prevent a retreating shoreline
+		     from leaving a mound of sand behind, we must smooth it out */
+		  if (flag == 1 && x < Xmax)
+		    {
+		      ShorefaceBathy[x+1][y] = ShorefaceBathy[x][y];
+		      /*flag = flag+1;*/
+		    }
+		}
+	    }
+            
+            
+	}
+    }
+	
+  /* Periodic Boundary COPY */
+  for (y = Ymax; y < 3*Ymax/2; y++)
+    {
+      for (x = 0; x < Xmax; x++)
+        {
+	  ShorefaceBathy[x][y-Ymax] = ShorefaceBathy[x][y];
+        }
+    }
+	
+  for (y = Ymax/2; y <= Ymax; y++)
+    {
+      for (x = 0; x < Xmax; x++)
+        {
+	  ShorefaceBathy[x][y+Ymax] = ShorefaceBathy[x][y];
+        }
+    }
+}
+
+
+
 
