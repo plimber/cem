@@ -47,14 +47,14 @@ extern "C"
 #endif
 
   /*  Run Control Parameters */
-#define HaveSinks			0       /* include sediment sinks in model run? */
+#define HaveSinks			('n')   /* include sediment sinks in model run? */
 #define Sinkiness			0.5     /* fractional value determines chance that sediment in the sink is deleted */
 #define STOP_AFTER			36500   /* Stop after what number of time steps? This is replaced by variable pushed here from BMI, 12/3/14 */
 #define NumberChunk			9       /* Number of chunks of rock in alongshore direction with different weathering rates LMV */
 #define NormalWeatheringRate 		0.2     /* Baseline rock retreat rate, m/yr   PWL */
 
-#define VaryCliffHeight			('y')   /* Vary cliff height for different rock weathering rates? PWL */
-#define Abrasion			('y')   /* Turn abrasion on? If yes, then rock weathering is maximized at a given amount of sediment cover (wcrit).
+#define VaryCliffHeight			('n')   /* Vary cliff height for different rock weathering rates? PWL */
+#define Abrasion			('n')   /* Turn abrasion on? If yes, then rock weathering is maximized at a given amount of sediment cover (wcrit).
                                                    Otherwise, use existing exponential weathering.  PWL */
 #define Wcrit				20      /* Sediment cover that maximizes rock weathering. PWL */
 #define N				4       /* How much to maximize weathering rate above bare-rock rate at Wcrit? PWL */
