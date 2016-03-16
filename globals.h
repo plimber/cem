@@ -9,6 +9,7 @@ extern "C"
 #include "consts.h"
 
 extern double CellDepth[Xmax][2 * Ymax];      /* Depth array */
+extern double ShorefaceBathy[Xmax][2 * Ymax];	/* Shoreface bathymetry array #SWAN */
 extern double CliffHeightSlow;  /* Cliff height above sea level for slow weathering rock PWL */
 extern double CliffHeightFast;   /* Cliff height above sea level for fast weathering rock PWL */
 
@@ -63,6 +64,8 @@ extern double AmountWeathered[MaxBeachLength];        /* Amount of rock weathere
 extern char SWANflag;
 
 extern double BreakDepth; /* Breaking wave depth found from SWAN run */
+extern double Angle;
+extern double WvHeight;
 
 /* Special SWAN matrices. */
 extern double ** ShelfDepth; /* SWAN bathymetry. */
@@ -71,7 +74,7 @@ extern double ** Dir; /* SWAN wave angles. */
 
 extern double EvaluateAngle; /* Temporary angle holder for the ConvertAngle function */
 
-/* for temporary debugging only, 5-5-14 */
+/* for temporary SWAN debugging only, 5-5-14 */
 /* UPDATE 11/20/14 -- now using these for upwind scheme fixing, so keep 'em around (probably should rename...) */
 extern double Qsdebug[MaxBeachLength];		
 extern double Hsigdebug[MaxBeachLength];    
@@ -79,8 +82,7 @@ extern double Dirdebug[MaxBeachLength];
 extern double Hddebug[MaxBeachLength];
 extern double xdebug[MaxBeachLength];
 extern double ydebug[MaxBeachLength];
-extern double Angle;
-extern double WvHeight;
+
 
 /* Miscellaneous Global Variables -- also will be included in the BMI structure */
 
